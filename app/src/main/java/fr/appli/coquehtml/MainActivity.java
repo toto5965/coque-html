@@ -7,7 +7,11 @@ import android.content.ActivityNotFoundException;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.graphics.Color;
+import android.graphics.pdf.PdfRenderer;
 import android.net.Uri;
+import android.os.ParcelFileDescriptor;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
@@ -74,6 +78,13 @@ public class MainActivity extends Activity {
     private String hookJs = "";
     private final Map<String, FileOutputStream> saves = new ConcurrentHashMap<>();
 
+    /** Un document PDF ouvert : fichier temporaire + moteur de rendu d'Android. */
+    private static class PdfDoc {
+        File file; FileOutputStream out; ParcelFileDescriptor pfd; PdfRenderer r;
+    }
+    private final Map<String, PdfDoc> pdfs = new ConcurrentHashMap<>();
+    private int pdfSeq = 0;
+
     // ------------------------------------------------------------------ cycle de vie
 
     @Override
@@ -116,6 +127,7 @@ public class MainActivity extends Activity {
         for (FileOutputStream o : saves.values()) {
             try { o.close(); } catch (Exception e) { /* ignore */ }
         }
+        for (String id : new ArrayList<>(pdfs.keySet())) closePdf(id);
         if (web != null) web.destroy();
         super.onDestroy();
     }
@@ -523,6 +535,17 @@ public class MainActivity extends Activity {
         return n;
     }
 
+    private void closePdf(String id) {
+        PdfDoc d = pdfs.remove(id);
+        if (d == null) return;
+        synchronized (d) {
+            try { if (d.r != null) d.r.close(); } catch (Exception e) { /* ignore */ }
+            try { if (d.pfd != null) d.pfd.close(); } catch (Exception e) { /* ignore */ }
+            try { if (d.out != null) d.out.close(); } catch (Exception e) { /* ignore */ }
+            if (d.file != null) d.file.delete();
+        }
+    }
+
     private class Bridge {
         @JavascriptInterface
         public String beginSave(String name) {
@@ -555,6 +578,92 @@ public class MainActivity extends Activity {
             try { o.close(); } catch (Exception e) { /* ignore */ }
             toast("Enregistré : " + ROOT_NAME + "/" + SAVE_NAME + "/" + new File(token).getName());
         }
+
+        // ---- Visionneuse PDF (la WebView ne sait pas afficher les PDF) ----
+        @JavascriptInterface
+        public String pdfBegin() {
+            try {
+                PdfDoc d = new PdfDoc();
+                d.file = File.createTempFile("pdf" + (++pdfSeq) + "_", ".pdf", getCacheDir());
+                d.out = new FileOutputStream(d.file);
+                String id = "p" + pdfSeq;
+                pdfs.put(id, d);
+                return id;
+            } catch (Exception e) {
+                Log.e("CoqueHtml", "pdfBegin", e);
+                return "";
+            }
+        }
+
+        @JavascriptInterface
+        public void pdfAppend(String id, String b64) {
+            PdfDoc d = pdfs.get(id);
+            if (d == null || d.out == null || b64 == null || b64.isEmpty()) return;
+            try { d.out.write(Base64.decode(b64, Base64.DEFAULT)); } catch (Exception e) { Log.e("CoqueHtml", "pdfAppend", e); }
+        }
+
+        /** Termine l'envoi et ouvre le document. Retourne le nombre de pages, ou -1 en cas d'erreur. */
+        @JavascriptInterface
+        public int pdfOpen(String id) {
+            PdfDoc d = pdfs.get(id);
+            if (d == null) return -1;
+            synchronized (d) {
+                try {
+                    if (d.out != null) { d.out.close(); d.out = null; }
+                    d.pfd = ParcelFileDescriptor.open(d.file, ParcelFileDescriptor.MODE_READ_ONLY);
+                    d.r = new PdfRenderer(d.pfd);
+                    return d.r.getPageCount();
+                } catch (Exception e) {
+                    Log.e("CoqueHtml", "pdfOpen", e);
+                    return -1;
+                }
+            }
+        }
+
+        /** Taille de la page en points : « largeur,hauteur ». */
+        @JavascriptInterface
+        public String pdfSize(String id, int index) {
+            PdfDoc d = pdfs.get(id);
+            if (d == null || d.r == null) return "";
+            synchronized (d) {
+                try {
+                    PdfRenderer.Page pg = d.r.openPage(index);
+                    try { return pg.getWidth() + "," + pg.getHeight(); } finally { pg.close(); }
+                } catch (Exception e) { return ""; }
+            }
+        }
+
+        /** Dessine la page à la largeur demandée (pixels) ; retourne l'image JPEG en Base64. */
+        @JavascriptInterface
+        public String pdfPage(String id, int index, int widthPx) {
+            PdfDoc d = pdfs.get(id);
+            if (d == null || d.r == null) return "";
+            synchronized (d) {
+                Bitmap bmp = null;
+                try {
+                    PdfRenderer.Page pg = d.r.openPage(index);
+                    try {
+                        int w = Math.max(100, Math.min(widthPx, 3000));
+                        int h = Math.max(1, Math.round(w * (float) pg.getHeight() / pg.getWidth()));
+                        while ((long) w * h > 9_000_000L) { w = w * 9 / 10; h = h * 9 / 10; }   // limite mémoire
+                        bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+                        bmp.eraseColor(Color.WHITE);
+                        pg.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY);
+                    } finally { pg.close(); }
+                    java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
+                    bmp.compress(Bitmap.CompressFormat.JPEG, 88, bo);
+                    return Base64.encodeToString(bo.toByteArray(), Base64.NO_WRAP);
+                } catch (Throwable e) {
+                    Log.e("CoqueHtml", "pdfPage", e);
+                    return "";
+                } finally {
+                    if (bmp != null) bmp.recycle();
+                }
+            }
+        }
+
+        @JavascriptInterface
+        public void pdfClose(String id) { closePdf(id); }
 
         @JavascriptInterface
         public void print() {
